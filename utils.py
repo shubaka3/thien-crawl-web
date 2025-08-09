@@ -5,10 +5,14 @@ from dotenv import load_dotenv
 from collections import deque
 from fastapi import FastAPI
 import os
+from urllib.parse import urljoin, urlparse, urldefrag
+import hashlib
+import difflib
+
 
 load_dotenv()
 
-MAX_DEPTH = int(os.getenv("MAX_DEPTH", 3))
+MAX_DEPTH = int(os.getenv("MAX_DEPTH", 2))
 OCR_API_URL = os.getenv("OCR_API_URL")
 OCR_MODEL = os.getenv("OCR_MODEL")
 OCR_LANG = os.getenv("OCR_LANG")
@@ -16,81 +20,175 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 5))
 
 app = FastAPI()
 
-# ======= HTML CLEANING =======
-def extract_content_blocks(html: str):
-    """
-    Tách HTML thành danh sách block: title (có thể gồm nhiều cấp) + content
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Xóa phần không cần
-    for selector in ["header", "nav", "footer", ".ads", ".advertisement", ".sidebar", "script", "style"]:
-        for tag in soup.select(selector):
-            tag.decompose()
-
-    blocks = []
-    current_titles = []  # chứa nhiều cấp tiêu đề
-    current_content = []
-
-    def flush_block():
-        nonlocal current_titles, current_content
-        if current_titles or current_content:
-            blocks.append({
-                "title": " - ".join([t for t in current_titles if t]).strip(),
-                "content": " ".join(current_content).strip()
-            })
-            current_content = []
-
-    for elem in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "b", "p", "li", "span", "div"]):
-        tag_name = elem.name.lower()
-        text = elem.get_text(" ", strip=True)
-        if not text:
-            continue
-
-        # Xác định đây là tiêu đề (heading, b, hoặc div ngắn)
-        if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6", "b"] or (
-            tag_name == "div" and len(text.split()) <= 8
-        ):
-            flush_block()
-            current_titles.append(text)
-            # Nếu là h1/h2 thì reset tiêu đề cấp dưới
-            if tag_name in ["h1", "h2"]:
-                current_titles = [text]
-            elif tag_name in ["h3", "h4"]:
-                current_titles = current_titles[:2] + [text]
-            elif tag_name in ["h5", "h6"]:
-                current_titles = current_titles[:3] + [text]
-        else:
-            current_content.append(text)
-
-    flush_block()
-    return blocks
+# ===== URL chuẩn hóa =====
+def normalize_url(url):
+    url, _ = urldefrag(url)
+    parsed = urlparse(url)
+    clean_query = "&".join(
+        q for q in parsed.query.split("&")
+        if q and not q.startswith("utm_") and not q.startswith("fbclid")
+    )
+    return parsed._replace(query=clean_query).geturl().rstrip("/")
 
 
-
-# ======= WEB CRAWLING =======
 def is_valid_link(base_domain, link):
     parsed = urlparse(link)
-
-    # Chỉ crawl cùng domain
     if parsed.netloc and parsed.netloc != base_domain:
         return False
-
-    # Loại bỏ các file không phải HTML
     skip_ext = (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".xml", ".css", ".js", ".zip")
     if any(parsed.path.lower().endswith(ext) for ext in skip_ext):
         return False
-
-    # Chỉ cho phép .html hoặc không có extension
-    if parsed.path and "." in parsed.path and not parsed.path.endswith(".html"):
-        return False
-
     return True
+
+
+def hash_block(title, content):
+    key = (title + content).encode("utf-8")
+    return hashlib.md5(key).hexdigest()
+
+
+def is_title_tag(tag):
+    if tag.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        return True
+    class_attr = tag.get("class") or []
+    class_text = " ".join(class_attr).lower()
+    keywords = ["title", "heading", "header", "post-title", "entry-title", "caption", "subtitle"]
+    return any(k in class_text for k in keywords)
+
+def remove_long_parent_blocks(blocks, containment_threshold=0.95, length_ratio_threshold=1.2, max_length=3000):
+    filtered = []
+    for i, block_i in enumerate(blocks):
+        content_i = block_i["content"]
+        len_i = len(content_i)
+
+        # Loại bỏ thô block quá dài
+        if len_i > max_length:
+            continue
+
+        is_parent = False
+        for j, block_j in enumerate(blocks):
+            if i == j:
+                continue
+            content_j = block_j["content"]
+            len_j = len(content_j)
+            if len_i <= len_j * length_ratio_threshold:
+                continue
+
+            # containment đơn giản
+            if content_j in content_i:
+                is_parent = True
+                break
+
+            ratio = difflib.SequenceMatcher(None, content_i, content_j).ratio()
+            if ratio > containment_threshold and len_i > len_j * length_ratio_threshold:
+                is_parent = True
+                break
+
+        if not is_parent:
+            filtered.append(block_i)
+    return filtered
+
+def filter_similar_blocks(blocks, threshold=0.9):
+    filtered = []
+    for block in blocks:
+        content = block["content"]
+        is_dup = False
+        for fb in filtered:
+            ratio = difflib.SequenceMatcher(None, content, fb["content"]).ratio()
+            if ratio > threshold or content in fb["content"] or fb["content"] in content:
+                is_dup = True
+                break
+        if not is_dup:
+            filtered.append(block)
+    return filtered
+
+def extract_content_blocks(html: str, depth: int = 0):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Loại bỏ vùng không cần thiết
+    for sel in ["header", "nav", "footer", ".sidebar", ".breadcrumb", ".pagination", ".ads", ".advertisement", "script", "style"]:
+        for tag in soup.select(sel):
+            tag.decompose()
+
+    main_area = soup.find("main") or soup.find("article") or soup.select_one(".content, .post")
+    if main_area:
+        soup = BeautifulSoup(str(main_area), "html.parser")
+
+    candidates = soup.find_all(["h1","h2","h3","h4","h5","h6","p","li","div","span"])
+    blocks = []
+    content_hashes = set()
+
+    i = len(candidates) - 1
+    while i >= 0:
+        elem = candidates[i]
+        text = elem.get_text(" ", strip=True)
+        if not text:
+            i -= 1
+            continue
+
+        # Xác định title
+        is_title = False
+        if elem.name in ["h1","h2","h3","h4","h5","h6"]:
+            is_title = True
+        else:
+            class_attr = " ".join(elem.get("class") or [])
+            if any(k in class_attr.lower() for k in ["title","header","heading","caption","subtitle"]) and len(text.split()) <= 10:
+                is_title = True
+
+        if is_title:
+            # Lấy content bên dưới title
+            content_texts = []
+            for j in range(i+1, len(candidates)):
+                c = candidates[j]
+                c_text = c.get_text(" ", strip=True)
+                if not c_text:
+                    continue
+                # Gặp title khác thì dừng
+                if c.name in ["h1","h2","h3","h4","h5","h6"]:
+                    break
+                content_texts.append(c_text)
+                if len(content_texts) >= 5:
+                    break
+
+            full_content = " ".join(content_texts).strip()
+            if full_content:
+                h = hashlib.md5(full_content.encode("utf-8")).hexdigest()
+                if h not in content_hashes:
+                    content_hashes.add(h)
+                    blocks.append({
+                        "title": text,
+                        "content": full_content,
+                        "elem": elem
+                    })
+        i -= 1
+
+    # Lọc bỏ các block "cha" chứa block con
+    filtered_blocks = []
+    for block in blocks:
+        is_parent = False
+        for other in blocks:
+            if other == block:
+                continue
+            # Nếu block['elem'] chứa other['elem'] => block là cha
+            if block["elem"].find(other["elem"]) is not None:
+                is_parent = True
+                break
+        if not is_parent:
+            filtered_blocks.append(block)
+
+    # Bỏ elem trước khi trả về
+    for b in filtered_blocks:
+        b.pop("elem", None)
+
+    # Đảo lại theo thứ tự xuất hiện trong html (từ trên xuống)
+    filtered_blocks.reverse()
+    blocks = remove_long_parent_blocks(filtered_blocks)
+    filtered_blocks = filter_similar_blocks(blocks)
+    return filtered_blocks
 
 def crawl_site(start_url, max_depth=2):
     base_domain = urlparse(start_url).netloc
     visited = set()
-    queue = deque([(start_url, 0)])
+    queue = deque([(normalize_url(start_url), 0)])
     results = []
 
     while queue:
@@ -104,16 +202,18 @@ def crawl_site(start_url, max_depth=2):
             r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
             if "text/html" not in r.headers.get("Content-Type", ""):
                 continue
-            blocks = extract_content_blocks(r.text)
+            blocks = extract_content_blocks(r.text, depth=depth)
             results.append({"url": url, "blocks": blocks})
 
             soup = BeautifulSoup(r.text, "html.parser")
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error fetching {url}: {e}")
             continue
 
+        # Lấy link hợp lệ để crawl tiếp
         for a in soup.find_all("a", href=True):
             full_url = urljoin(url, a["href"])
+            full_url = normalize_url(full_url)
             if is_valid_link(base_domain, full_url) and full_url not in visited:
                 queue.append((full_url, depth + 1))
 
@@ -148,10 +248,10 @@ def ocr_image(file_path: str):
         r.raise_for_status()
         return group_ocr_text(r.json())
 
-# ======= API ENDPOINT =======
-@app.get("/crawl")
-def crawl(url: str, depth: int = 2):
-    if depth > MAX_DEPTH:
-        depth = MAX_DEPTH
-    results = crawl_site(url, depth)
-    return {"count": len(results), "data": results}
+# # ======= API ENDPOINT =======
+# @app.get("/crawl")
+# def crawl(url: str, depth: int = 2):
+#     if depth > MAX_DEPTH:
+#         depth = MAX_DEPTH
+#     results = crawl_site(url, depth)
+#     return {"count": len(results), "data": results}
