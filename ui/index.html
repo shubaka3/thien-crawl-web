@@ -57,7 +57,7 @@
       loader.classList.remove('d-none');
 
       // Gọi API backend
-      const res = await fetch(`http://localhost:8123/crawl?url=${encodeURIComponent(url)}&depth=${depth}`);
+      const res = await fetch(`http://14.225.215.151:8001/crawl?url=${encodeURIComponent(url)}&depth=${depth}`);
       if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
       
       const data = await res.json();
