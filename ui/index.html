@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Crawl Website</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+
+<div class="container py-4">
+  <h2 class="mb-4">Crawler Demo</h2>
+
+  <!-- Form nhập URL và depth -->
+  <form id="crawl-form" class="row g-3">
+    <div class="col-md-6">
+      <label for="url" class="form-label">Link Website</label>
+      <input type="text" class="form-control" id="url" placeholder="https://emg.vn/tuyen-dung" required>
+    </div>
+    <div class="col-md-2">
+      <label for="depth" class="form-label">Depth</label>
+      <input type="number" class="form-control" id="depth" min="1" max="5" value="3">
+    </div>
+    <div class="col-md-2 align-self-end">
+      <button type="submit" class="btn btn-primary w-100">Crawl</button>
+    </div>
+  </form>
+
+  <!-- Loader -->
+  <div id="loader" class="text-center mt-4 d-none">
+    <div class="spinner-border text-primary" role="status">
+      <span class="visually-hidden">Đang tải...</span>
+    </div>
+    <p class="mt-2">Đang crawl dữ liệu...</p>
+  </div>
+
+  <!-- Hiển thị kết quả -->
+  <div id="data-container" class="mt-4"></div>
+</div>
+
+<script>
+  const loader = document.getElementById('loader');
+  const container = document.getElementById('data-container');
+
+  document.getElementById('crawl-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+
+    const url = document.getElementById('url').value.trim();
+    const depth = document.getElementById('depth').value || 3;
+
+    if (!url) return alert("Vui lòng nhập URL!");
+
+    try {
+      // Clear dữ liệu cũ
+      container.innerHTML = '';
+
+      // Hiện loader
+      loader.classList.remove('d-none');
+
+      // Gọi API backend
+      const res = await fetch(`http://localhost:8123/crawl?url=${encodeURIComponent(url)}&depth=${depth}`);
+      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+      
+      const data = await res.json();
+
+      // Hiển thị depth
+      const depthInfo = document.createElement('p');
+      depthInfo.className = 'text-muted';
+      depthInfo.innerText = `Depth: ${data.depth}`;
+      container.appendChild(depthInfo);
+
+      // Render từng page
+      data.pages.forEach(page => {
+        const pageCard = document.createElement('div');
+        pageCard.className = 'card mb-3 shadow-sm';
+
+        let blocksHtml = '';
+        page.blocks.forEach(block => {
+          blocksHtml += `
+            <div class="mb-3">
+              <h1 class="h5 text-primary">${block.title || '(Không có tiêu đề)'}</h1>
+              <p>${block.content || ''}</p>
+            </div>
+          `;
+        });
+
+        pageCard.innerHTML = `
+          <div class="card-header">
+            <strong>URL:</strong> <a href="${page.url}" target="_blank">${page.url}</a>
+          </div>
+          <div class="card-body">
+            ${blocksHtml}
+          </div>
+        `;
+
+        container.appendChild(pageCard);
+      });
+
+    } catch (err) {
+      console.error(err);
+      alert("Có lỗi xảy ra khi crawl dữ liệu!");
+    } finally {
+      // Ẩn loader
+      loader.classList.add('d-none');
+    }
+  });
+</script>
+
+</body>
+</html>

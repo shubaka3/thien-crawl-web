@@ -2,9 +2,17 @@ from fastapi import FastAPI, UploadFile, Form
 from utils import crawl_site, ocr_image
 import shutil
 import tempfile
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Web Crawler + OCR API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Hoặc chỉ cho phép domain cụ thể
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Crawl endpoint
 @app.get("/crawl")
 def crawl(url: str, depth: int = None):
